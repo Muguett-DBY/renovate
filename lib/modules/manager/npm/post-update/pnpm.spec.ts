@@ -3,6 +3,7 @@ import { envMock, mockExecAll } from '~test/exec-util.ts';
 import { Fixtures } from '~test/fixtures.ts';
 import { env, fs, partial } from '~test/util.ts';
 import { GlobalConfig } from '../../../../config/global.ts';
+import * as hostRules from '../../../../util/host-rules.ts';
 import type { PostUpdateConfig, Upgrade } from '../../types.ts';
 import { getNodeToolConstraint } from './node-version.ts';
 import * as pnpmHelper from './pnpm.ts';
@@ -39,6 +40,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     config = partial<PostUpdateConfig>({ constraints: { pnpm: '^2.0.0' } });
     env.getChildProcessEnv.mockReturnValue(envMock.basic);
     GlobalConfig.set({ localDir: '', binarySource: 'global' });
+    hostRules.clear();
     vi.mocked(getNodeToolConstraint).mockResolvedValueOnce({
       toolName: 'node',
       constraint: '16.16.0',
@@ -50,6 +52,64 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     fs.readLocalFile.mockResolvedValue('package-lock-contents');
     await pnpmHelper.generateLockFile('some-dir', {}, config);
     expect(execSnapshots).toMatchObject([]);
+  });
+
+  it.each`
+    matchHost                               | gitUrl
+    ${'api.github.com'}                     | ${'github.com/'}
+    ${'https://github.com/org/private.git'} | ${'github.com/org/private.git'}
+  `(
+    'passes Git authentication for $matchHost to pnpm',
+    async ({ matchHost, gitUrl }) => {
+      const execSnapshots = mockExecAll();
+      fs.readLocalFile.mockResolvedValue('package-lock-contents');
+      hostRules.add({ hostType: 'github', matchHost, token: 'test-token' });
+
+      const result = await pnpmHelper.generateLockFile(
+        'some-dir',
+        {},
+        config,
+        upgrades,
+      );
+
+      expect(result.lockFile).toBe('package-lock-contents');
+      expect(execSnapshots).toMatchObject([
+        {
+          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+          options: {
+            env: {
+              GIT_CONFIG_COUNT: '3',
+              GIT_CONFIG_KEY_0: `url.https://ssh:test-token@${gitUrl}.insteadOf`,
+              GIT_CONFIG_VALUE_0: `ssh://git@${gitUrl}`,
+              GIT_CONFIG_KEY_1: `url.https://git:test-token@${gitUrl}.insteadOf`,
+              GIT_CONFIG_VALUE_1: `git@${gitUrl.replace('github.com/', 'github.com:')}`,
+              GIT_CONFIG_KEY_2: `url.https://test-token@${gitUrl}.insteadOf`,
+              GIT_CONFIG_VALUE_2: `https://${gitUrl}`,
+            },
+          },
+        },
+      ]);
+    },
+  );
+
+  it('does not pass registry-only credentials to Git', async () => {
+    const execSnapshots = mockExecAll();
+    fs.readLocalFile.mockResolvedValue('package-lock-contents');
+    hostRules.add({
+      hostType: 'npm',
+      matchHost: 'https://registry.example.com/',
+      token: 'registry-token',
+    });
+
+    await pnpmHelper.generateLockFile('some-dir', {}, config, upgrades);
+
+    expect(execSnapshots).toHaveLength(1);
+    expect(execSnapshots[0].options?.env).not.toHaveProperty(
+      'GIT_CONFIG_COUNT',
+    );
+    expect(execSnapshots[0].options?.env).not.toHaveProperty(
+      'GIT_CONFIG_KEY_0',
+    );
   });
 
   it('generates lock files', async () => {
