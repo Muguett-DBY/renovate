@@ -4,7 +4,7 @@ import upath from 'upath';
 import { GlobalConfig } from '../../../../config/global.ts';
 import { TEMPORARY_ERROR } from '../../../../constants/error-messages.ts';
 import { logger } from '../../../../logger/index.ts';
-import { exec, getToolSettingsOptions } from '../../../../util/exec/index.ts';
+import { getToolSettingsOptions } from '../../../../util/exec/index.ts';
 import type {
   ExecOptions,
   ExtraEnv,
@@ -17,10 +17,11 @@ import {
   localPathExists,
   readLocalFile,
 } from '../../../../util/fs/index.ts';
-import { getGitEnvironmentVariables } from '../../../../util/git/auth.ts';
+import { withGitEnvironment } from '../../../../util/git/exec.ts';
 import { uniqueStrings } from '../../../../util/string.ts';
 import { parseSingleYaml } from '../../../../util/yaml.ts';
 import type { PostUpdateConfig, Upgrade } from '../../types.ts';
+import { resolveToolConstraint } from '../../util.ts';
 import { PNPM_CACHE_DIR, PNPM_STORE_DIR } from '../constants.ts';
 import type { PnpmWorkspaceFile } from '../extract/types.ts';
 import { getNodeToolConstraint } from './node-version.ts';
@@ -30,6 +31,8 @@ import {
   getPackageManagerVersion,
   lazyLoadPackageJson,
 } from './utils.ts';
+
+const gitExec = withGitEnvironment();
 
 function getPnpmConstraintFromUpgrades(upgrades: Upgrade[]): string | null {
   for (const upgrade of upgrades) {
@@ -56,9 +59,13 @@ export async function generateLockFile(
       toolName: 'pnpm',
       constraint:
         getPnpmConstraintFromUpgrades(upgrades) ?? // if pnpm is being upgraded, it comes first
-        config.constraints?.pnpm ?? // from user config or extraction
-        getPackageManagerVersion('pnpm', await lazyPgkJson.getValue()) ?? // look in package.json > packageManager or engines
-        (await getConstraintFromLockFile(lockFileName)), // use lockfileVersion to find pnpm version range
+        (await resolveToolConstraint(
+          config,
+          'pnpm',
+          async () =>
+            getPackageManagerVersion('pnpm', await lazyPgkJson.getValue()) ?? // look in package.json > packageManager or engines
+            (await getConstraintFromLockFile(lockFileName)), // use lockfileVersion to find pnpm version range
+        )),
     };
 
     const pnpmConfigCacheDir = await ensureCacheDir(PNPM_CACHE_DIR);
@@ -73,8 +80,6 @@ export async function generateLockFile(
       // pnpm stops reading npm_config_* env vars since v11
       pnpm_config_cache_dir: pnpmConfigCacheDir,
       pnpm_config_store_dir: pnpmConfigStoreDir,
-      // allows pnpm to resolve git-hosted private packages
-      ...getGitEnvironmentVariables(),
     };
 
     const { nodeMaxMemory } = getToolSettingsOptions(config.toolSettings);
@@ -91,7 +96,7 @@ export async function generateLockFile(
         pnpmToolConstraint,
       ],
     };
-    /* v8 ignore next 4 -- needs test */
+    /* v8 ignore next -- needs test */
     if (GlobalConfig.get('exposeAllEnv')) {
       extraEnv.NPM_AUTH = env.NPM_AUTH;
       extraEnv.NPM_EMAIL = env.NPM_EMAIL;
@@ -133,8 +138,9 @@ export async function generateLockFile(
     const lockUpdates = upgrades.filter((upgrade) => upgrade.isLockfileUpdate);
 
     if (lockUpdates.length !== upgrades.length) {
-      // This command updates the lock file based on package.json
-      commands.push(`pnpm install ${args}`);
+      // This command updates the lock file based on package.json.
+      // Pass `--no-frozen-lockfile` to ensure the lockfile is updated
+      commands.push(`pnpm install ${args} --no-frozen-lockfile`);
     }
 
     // rangeStrategy = update-lockfile
@@ -152,7 +158,7 @@ export async function generateLockFile(
 
     // postUpdateOptions
     if (config.postUpdateOptions?.includes('pnpmDedupe')) {
-      commands.push('pnpm dedupe --ignore-scripts');
+      commands.push(`pnpm dedupe ${args.replace(' --recursive', '')}`);
     }
 
     if (upgrades.find((upgrade) => upgrade.isLockFileMaintenance)) {
@@ -169,7 +175,7 @@ export async function generateLockFile(
       }
     }
 
-    await exec(commands, execOptions);
+    await gitExec(commands, execOptions);
     lockFile = await readLocalFile(lockFileName, 'utf8');
   } catch (err) {
     // v8 ignore if -- TODO: add test #40625

@@ -3,6 +3,7 @@ import { envMock, mockExecAll } from '~test/exec-util.ts';
 import { Fixtures } from '~test/fixtures.ts';
 import { env, fs, partial } from '~test/util.ts';
 import { GlobalConfig } from '../../../../config/global.ts';
+import { resetPrefetchedImages } from '../../../../util/exec/docker/index.ts';
 import * as hostRules from '../../../../util/host-rules.ts';
 import type { PostUpdateConfig, Upgrade } from '../../types.ts';
 import { getNodeToolConstraint } from './node-version.ts';
@@ -41,6 +42,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     env.getChildProcessEnv.mockReturnValue(envMock.basic);
     GlobalConfig.set({ localDir: '', binarySource: 'global' });
     hostRules.clear();
+    resetPrefetchedImages();
     vi.mocked(getNodeToolConstraint).mockResolvedValueOnce({
       toolName: 'node',
       constraint: '16.16.0',
@@ -75,15 +77,15 @@ describe('modules/manager/npm/post-update/pnpm', () => {
       expect(result.lockFile).toBe('package-lock-contents');
       expect(execSnapshots).toMatchObject([
         {
-          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
           options: {
             env: {
               GIT_CONFIG_COUNT: '3',
-              GIT_CONFIG_KEY_0: `url.https://ssh:test-token@${gitUrl}.insteadOf`,
+              GIT_CONFIG_KEY_0: `url.https://x-access-token:test-token@${gitUrl}.insteadOf`,
               GIT_CONFIG_VALUE_0: `ssh://git@${gitUrl}`,
-              GIT_CONFIG_KEY_1: `url.https://git:test-token@${gitUrl}.insteadOf`,
+              GIT_CONFIG_KEY_1: `url.https://x-access-token:test-token@${gitUrl}.insteadOf`,
               GIT_CONFIG_VALUE_1: `git@${gitUrl.replace('github.com/', 'github.com:')}`,
-              GIT_CONFIG_KEY_2: `url.https://test-token@${gitUrl}.insteadOf`,
+              GIT_CONFIG_KEY_2: `url.https://x-access-token:test-token@${gitUrl}.insteadOf`,
               GIT_CONFIG_VALUE_2: `https://${gitUrl}`,
             },
           },
@@ -91,6 +93,103 @@ describe('modules/manager/npm/post-update/pnpm', () => {
       ]);
     },
   );
+
+  it('appends authentication without replacing approved Git configuration', async () => {
+    const execSnapshots = mockExecAll();
+    fs.readLocalFile.mockResolvedValue('package-lock-contents');
+    env.getChildProcessEnv.mockReturnValue({
+      ...envMock.basic,
+      GIT_CONFIG_COUNT: '1',
+      GIT_CONFIG_KEY_0: 'core.sshCommand',
+      GIT_CONFIG_VALUE_0: 'ssh -o BatchMode=yes',
+    });
+    hostRules.add({
+      hostType: 'github',
+      matchHost: 'api.github.com',
+      token: 'test-token',
+    });
+
+    const result = await pnpmHelper.generateLockFile(
+      'some-dir',
+      {},
+      config,
+      upgrades,
+    );
+
+    expect(result.lockFile).toBe('package-lock-contents');
+    expect(execSnapshots).toMatchObject([
+      {
+        options: {
+          env: {
+            GIT_CONFIG_COUNT: '4',
+            GIT_CONFIG_KEY_0: 'core.sshCommand',
+            GIT_CONFIG_VALUE_0: 'ssh -o BatchMode=yes',
+            GIT_CONFIG_KEY_1:
+              'url.https://x-access-token:test-token@github.com/.insteadOf',
+            GIT_CONFIG_VALUE_1: 'ssh://git@github.com/',
+            GIT_CONFIG_KEY_2:
+              'url.https://x-access-token:test-token@github.com/.insteadOf',
+            GIT_CONFIG_VALUE_2: 'git@github.com:',
+            GIT_CONFIG_KEY_3:
+              'url.https://x-access-token:test-token@github.com/.insteadOf',
+            GIT_CONFIG_VALUE_3: 'https://github.com/',
+          },
+        },
+      },
+    ]);
+  });
+
+  it('passes Git authentication into the pnpm Docker container', async () => {
+    GlobalConfig.set({
+      localDir: '',
+      cacheDir: '/tmp',
+      binarySource: 'docker',
+      allowScripts: true,
+      dockerSidecarImage: 'ghcr.io/renovatebot/base-image',
+    });
+    const execSnapshots = mockExecAll();
+    fs.readLocalFile.mockResolvedValue('package-lock-contents');
+    hostRules.add({
+      hostType: 'github',
+      matchHost: 'api.github.com',
+      token: 'test-token',
+    });
+
+    const result = await pnpmHelper.generateLockFile(
+      'some-dir',
+      {},
+      { ...config, constraints: { pnpm: '6.0.0' } },
+      upgrades,
+    );
+
+    expect(result.lockFile).toBe('package-lock-contents');
+    const containerExec = execSnapshots.find(({ cmd }) =>
+      cmd.startsWith('docker run'),
+    );
+    expect(containerExec).toMatchObject({
+      options: {
+        env: {
+          GIT_CONFIG_COUNT: '3',
+          GIT_CONFIG_KEY_0:
+            'url.https://x-access-token:test-token@github.com/.insteadOf',
+          GIT_CONFIG_VALUE_0: 'ssh://git@github.com/',
+          GIT_CONFIG_KEY_1:
+            'url.https://x-access-token:test-token@github.com/.insteadOf',
+          GIT_CONFIG_VALUE_1: 'git@github.com:',
+          GIT_CONFIG_KEY_2:
+            'url.https://x-access-token:test-token@github.com/.insteadOf',
+          GIT_CONFIG_VALUE_2: 'https://github.com/',
+        },
+      },
+    });
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_COUNT ');
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_KEY_0 ');
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_VALUE_0 ');
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_KEY_1 ');
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_VALUE_1 ');
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_KEY_2 ');
+    expect(containerExec?.cmd).toContain('-e GIT_CONFIG_VALUE_2 ');
+  });
 
   it('does not pass registry-only credentials to Git', async () => {
     const execSnapshots = mockExecAll();
@@ -123,7 +222,12 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     );
     expect(fs.readLocalFile).toHaveBeenCalledTimes(1);
     expect(res.lockFile).toBe('package-lock-contents');
-    expect(execSnapshots).toMatchSnapshot();
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+        options: { cwd: 'some-dir' },
+      },
+    ]);
   });
 
   it('catches errors', async () => {
@@ -140,7 +244,12 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(fs.readLocalFile).toHaveBeenCalledTimes(1);
     expect(res.error).toBeTrue();
     expect(res.lockFile).toBeUndefined();
-    expect(execSnapshots).toMatchSnapshot();
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+        options: { cwd: 'some-dir' },
+      },
+    ]);
   });
 
   it('finds pnpm globally', async () => {
@@ -154,7 +263,12 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     );
     expect(fs.readLocalFile).toHaveBeenCalledTimes(1);
     expect(res.lockFile).toBe('package-lock-contents');
-    expect(execSnapshots).toMatchSnapshot();
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+        options: { cwd: 'some-dir' },
+      },
+    ]);
   });
 
   it('performs lock file updates', async () => {
@@ -339,7 +453,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(res.lockFile).toBe('package-lock-contents');
     expect(execSnapshots).toMatchObject([
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
       },
       {
         cmd: 'pnpm update --no-save some-dep@1.1.0 --lockfile-only --ignore-scripts --ignore-pnpmfile',
@@ -356,7 +470,12 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(fs.readLocalFile).toHaveBeenCalledTimes(1);
     expect(fs.deleteLocalFile).toHaveBeenCalledTimes(1);
     expect(res.lockFile).toBe('package-lock-contents');
-    expect(execSnapshots).toMatchSnapshot();
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+        options: { cwd: 'some-dir' },
+      },
+    ]);
   });
 
   it('performs dedupe', async () => {
@@ -373,10 +492,37 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(res.lockFile).toBe('package-lock-contents');
     expect(execSnapshots).toMatchObject([
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
       },
       {
-        cmd: 'pnpm dedupe --ignore-scripts',
+        cmd: 'pnpm dedupe --lockfile-only --ignore-scripts --ignore-pnpmfile',
+      },
+    ]);
+  });
+
+  it('performs dedupe without --recursive for workspaces', async () => {
+    const execSnapshots = mockExecAll();
+    mockPnpmFiles(
+      codeBlock`
+        packages:
+          - pkg-a
+      `,
+    );
+    const postUpdateOptions = ['pnpmDedupe'];
+    const res = await pnpmHelper.generateLockFile(
+      'some-folder',
+      {},
+      { ...config, postUpdateOptions },
+      upgrades,
+    );
+    expect(fs.readLocalFile).toHaveBeenCalledTimes(2);
+    expect(res.lockFile).toBe('package-lock-contents');
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'pnpm install --lockfile-only --recursive --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+      },
+      {
+        cmd: 'pnpm dedupe --lockfile-only --ignore-scripts --ignore-pnpmfile',
       },
     ]);
   });
@@ -394,7 +540,12 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     ]);
     expect(fs.readLocalFile).toHaveBeenCalledTimes(1);
     expect(res.lockFile).toBe('package-lock-contents');
-    expect(execSnapshots).toMatchSnapshot();
+    expect(execSnapshots).toMatchObject([
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+        options: { cwd: 'some-dir' },
+      },
+    ]);
     // TODO: check docker preCommands
   });
 
@@ -420,7 +571,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(res.lockFile).toBe('package-lock-contents');
     expect(execSnapshots).toMatchObject([
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
         options: {
           cwd: 'some-folder',
           env: {
@@ -464,7 +615,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(res.lockFile).toBe('package-lock-contents');
     expect(execSnapshots).toMatchObject([
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
         options: {
           cwd: 'some-folder',
           env: {
@@ -521,7 +672,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
     expect(res.lockFile).toBe('package-lock-contents');
     expect(execSnapshots).toMatchObject([
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
         options: {
           cwd: 'some-folder',
           env: {
@@ -584,14 +735,15 @@ describe('modules/manager/npm/post-update/pnpm', () => {
         cmd:
           'docker run --rm --name=renovate_sidecar --label=renovate_child ' +
           '-v "/tmp":"/tmp" ' +
+          '-e CI ' +
           '-e CONTAINERBASE_CACHE_DIR ' +
           '-w "some-dir" ' +
           'ghcr.io/renovatebot/base-image ' +
-          'bash -l -c "' +
+          "bash -l -c '" +
           'install-tool node 16.16.0 ' +
           '&& install-tool pnpm 6.0.0 ' +
-          '&& pnpm install --lockfile-only' +
-          '"',
+          '&& pnpm install --lockfile-only --no-frozen-lockfile' +
+          "'",
       },
     ]);
   });
@@ -616,7 +768,55 @@ describe('modules/manager/npm/post-update/pnpm', () => {
       { cmd: 'install-tool node 16.16.0' },
       { cmd: 'install-tool pnpm 6.0.0' },
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+      },
+    ]);
+  });
+
+  it('falls back to the extracted pnpm constraint', async () => {
+    GlobalConfig.set({
+      localDir: '',
+      cacheDir: '/tmp',
+      binarySource: 'install',
+    });
+    const execSnapshots = mockExecAll();
+    fs.readLocalFile.mockResolvedValue('package-lock-contents');
+    await pnpmHelper.generateLockFile(
+      'some-dir',
+      {},
+      { ...config, constraints: {}, extractedConstraints: { pnpm: '6.0.0' } },
+      upgrades,
+    );
+    expect(execSnapshots).toMatchObject([
+      { cmd: 'install-tool node 16.16.0' },
+      { cmd: 'install-tool pnpm 6.0.0' },
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
+      },
+    ]);
+  });
+
+  it('prefers the derived pnpm constraint over the extracted one', async () => {
+    GlobalConfig.set({
+      localDir: '',
+      cacheDir: '/tmp',
+      binarySource: 'install',
+    });
+    const execSnapshots = mockExecAll();
+    // package.json
+    fs.readLocalFile.mockResolvedValueOnce('{"packageManager":"pnpm@7.0.0"}');
+    fs.readLocalFile.mockResolvedValue('package-lock-contents');
+    await pnpmHelper.generateLockFile(
+      'some-dir',
+      {},
+      { ...config, constraints: {}, extractedConstraints: { pnpm: '6.0.0' } },
+      upgrades,
+    );
+    expect(execSnapshots).toMatchObject([
+      { cmd: 'install-tool node 16.16.0' },
+      { cmd: 'install-tool pnpm 7.0.0' },
+      {
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
       },
     ]);
   });
@@ -642,7 +842,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
       { cmd: 'install-tool node 16.16.0' },
       { cmd: 'install-tool pnpm 6.0.0' },
       {
-        cmd: 'pnpm install --lockfile-only --ignore-scripts',
+        cmd: 'pnpm install --lockfile-only --ignore-scripts --no-frozen-lockfile',
       },
     ]);
   });
@@ -670,7 +870,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
       expect(res.lockFile).toBe('package-lock-contents');
       expect(execSnapshots).toMatchObject([
         {
-          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
         },
       ]);
 
@@ -697,7 +897,7 @@ describe('modules/manager/npm/post-update/pnpm', () => {
       expect(res.lockFile).toBe('package-lock-contents');
       expect(execSnapshots).toMatchObject([
         {
-          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile',
+          cmd: 'pnpm install --lockfile-only --ignore-scripts --ignore-pnpmfile --no-frozen-lockfile',
         },
       ]);
 
